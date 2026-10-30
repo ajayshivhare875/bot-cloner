@@ -3,7 +3,7 @@ Features: real SMM API (services/orders/balance), live order status,
 UPI deposit system with admin approval, admin panel, price list.
 Owner configures API URL + key + UPI ID via /admin after cloning.
 """
-INFO = {"name": "SMM Panel Pro", "emoji": "📣", "description": "FULL SMM panel: real API orders, live status, UPI deposits, admin panel"}
+INFO = {"name": "SMM Panel Pro", "emoji": "📣", "description": "FULL SMM panel: real API orders, FamBridge auto-payments, admin panel"}
 
 import os, json, re, time, urllib.parse
 import requests
@@ -69,6 +69,25 @@ def get_services(d):
     return SVC_CACHE["data"], ""
 
 
+GATEWAY_URL = "https://fambridge.onrender.com"
+
+
+def gb(cfg, method, path, payload=None):
+    """Call FamBridge gateway API. Returns (status_code, json)."""
+    base = (cfg.get("gateway_url") or GATEWAY_URL).rstrip("/")
+    try:
+        if method == "GET":
+            r = requests.get(base + path, params=payload, timeout=20)
+        else:
+            r = requests.post(base + path, json=payload, timeout=20)
+        try:
+            return r.status_code, r.json()
+        except Exception:
+            return r.status_code, {}
+    except Exception as e:
+        return 0, {"error": type(e).__name__}
+
+
 def main_menu(is_owner):
     kb = [
         [InlineKeyboardButton("🛒 New Order", callback_data="new_order"),
@@ -89,6 +108,7 @@ def admin_menu(d):
         [InlineKeyboardButton(f"🔗 API URL: {'✅' if cfg.get('api_url') else '❌'}", callback_data="adm_url")],
         [InlineKeyboardButton(f"🔑 API Key: {'✅' if cfg.get('api_key') else '❌'}", callback_data="adm_key")],
         [InlineKeyboardButton(f"💸 UPI ID: {'✅' if cfg.get('upi') else '❌'}", callback_data="adm_upi")],
+        [InlineKeyboardButton(f"🌉 FamBridge Gateway: {'✅' if cfg.get('gateway_key') else '❌'}", callback_data="adm_gw")],
         [InlineKeyboardButton("🧪 Test API", callback_data="adm_test")],
         [InlineKeyboardButton(f"💳 Deposits ({pend} pending)", callback_data="adm_deps")],
         [InlineKeyboardButton("➕ Add Balance", callback_data="adm_addbal")],
@@ -230,11 +250,15 @@ def run(token):
 
         # ----- ADD FUNDS -----
         elif data == "addfunds":
-            if not d["cfg"].get("upi"):
+            if d["cfg"].get("gateway_key"):
+                c.user_data["deposit"] = {"stage": "amount", "via": "gateway"}
+                await q.edit_message_text("💳 <b>Add Funds</b> 🌉\n<i>Auto-verified via FamBridge — no waiting!</i>\n\n💵 Send amount (min ₹10):", parse_mode="HTML")
+            elif d["cfg"].get("upi"):
+                c.user_data["deposit"] = {"stage": "amount", "via": "manual"}
+                await q.edit_message_text("💳 <b>Add Funds</b>\n\n💵 Send amount (min ₹10):", parse_mode="HTML")
+            else:
                 await q.edit_message_text("⚠️ Deposits not set up yet. Contact admin.")
                 return
-            c.user_data["deposit"] = {"stage": "amount"}
-            await q.edit_message_text("💳 <b>Add Funds</b>\n\n💵 Send amount (min ₹10):", parse_mode="HTML")
 
         elif data == "dep_paid":
             dep = c.user_data.get("deposit", {})
@@ -247,6 +271,40 @@ def run(token):
             c.user_data.pop("deposit", None)
             await q.edit_message_text("❌ Deposit cancelled.", reply_markup=main_menu(is_owner))
 
+        elif data.startswith("gwcheck:"):
+            did = data[8:]
+            v = d["deposits"].get(did)
+            if not v or v.get("uid") != str(uid):
+                await q.edit_message_text("❌ Deposit not found.")
+                return
+            if v.get("status") != "pending_gw":
+                await q.edit_message_text(f"Deposit already {v.get('status')}.", reply_markup=main_menu(is_owner))
+                return
+            await q.answer("Checking payment...")
+            code, j = gb(d["cfg"], "GET", "/api/order_status",
+                         {"api_key": d["cfg"].get("gateway_key"), "order_id": v.get("gw_order")})
+            st = (j.get("status") or "").lower() if isinstance(j, dict) else ""
+            if st == "paid":
+                v["status"] = "approved"
+                _add_bal(d, uid, v["amount"])
+                _save(d)
+                await q.edit_message_text(
+                    f"✅ <b>Payment verified!</b> 🌉\n\n💰 ₹{v['amount']:.2f} added to your balance.\n"
+                    f"New balance: ₹{_bal(d, uid):.2f}",
+                    reply_markup=main_menu(is_owner), parse_mode="HTML")
+            elif st == "expired":
+                v["status"] = "expired"
+                _save(d)
+                await q.edit_message_text("⌛ This QR expired (15 min). Start a new deposit from 💳 Add Funds.",
+                                          reply_markup=main_menu(is_owner))
+            else:
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Check Again", callback_data=f"gwcheck:{did}")],
+                    [InlineKeyboardButton("❌ Cancel", callback_data="dep_cancel")]])
+                await q.edit_message_text(
+                    "⏳ Payment not detected yet.\n\nPay the exact QR amount in your UPI app, then tap 🔄 Check Again.",
+                    reply_markup=kb)
+
         # ----- ADMIN -----
         elif data == "admin":
             if not is_owner:
@@ -258,9 +316,21 @@ def run(token):
             if not is_owner:
                 return
             labels = {"adm_url": "SMM API URL (e.g. https://panel.com/api/v2)",
-                      "adm_key": "SMM API Key", "adm_upi": "Your UPI ID for deposits"}
+                      "adm_key": "SMM API Key", "adm_upi": "Your UPI ID for deposits (manual fallback)"}
             c.user_data["admin_set"] = data
             await q.edit_message_text(f"✍️ Send <b>{labels[data]}</b>:", parse_mode="HTML")
+
+        elif data == "adm_gw":
+            if not is_owner:
+                return
+            c.user_data["admin_set"] = "adm_gw"
+            await q.edit_message_text(
+                "🌉 <b>FamBridge Payment Gateway</b>\n\n"
+                "✍️ Send your <b>Gateway API Key</b>\n"
+                "(FamBridge bot → 🔑 My API Key)\n\n"
+                "Once connected, all deposits auto-verify — no manual approval! 🚀\n\n"
+                "Send <code>off</code> to disable.",
+                parse_mode="HTML")
 
         elif data == "adm_test":
             if not is_owner:
@@ -366,6 +436,28 @@ def run(token):
                 SVC_CACHE.update({"at": 0, "data": []})
             elif aset == "adm_upi":
                 d["cfg"]["upi"] = txt
+            elif aset == "adm_gw":
+                if txt.lower() == "off":
+                    d["cfg"].pop("gateway_key", None)
+                    _save(d)
+                    c.user_data.pop("admin_set", None)
+                    await u.message.reply_text("🌉 Gateway disabled. Manual UPI deposits will be used.", reply_markup=admin_menu(d))
+                    return
+                # validate key: fake order -> 404 means key OK, 401 means bad key
+                code, j = gb(d["cfg"], "GET", "/api/order_status",
+                             {"api_key": txt, "order_id": "ord_keycheck000"})
+                if code == 401:
+                    await u.message.reply_text("❌ Invalid API key! Copy it again from FamBridge bot → 🔑 My API Key.")
+                    return
+                if code == 0:
+                    await u.message.reply_text(f"❌ Cannot reach gateway: {j.get('error')}. Try again later.")
+                    return
+                d["cfg"]["gateway_key"] = txt
+                _save(d)
+                c.user_data.pop("admin_set", None)
+                await u.message.reply_text("🌉 <b>Gateway connected!</b> ✅\n\nAll deposits will now <b>auto-verify</b> — no manual approval needed! 🚀",
+                                           reply_markup=admin_menu(d), parse_mode="HTML")
+                return
             elif aset == "adm_addbal":
                 try:
                     parts = txt.split()
@@ -428,6 +520,37 @@ def run(token):
                     await u.message.reply_text("❌ Amount must be ₹10 or more.")
                     return
                 dep["amount"] = round(amt, 2)
+                # ---- FamBridge gateway auto-payment ----
+                if dep.get("via") == "gateway":
+                    code, j = gb(d["cfg"], "POST", "/api/create_order",
+                                 {"api_key": d["cfg"].get("gateway_key"),
+                                  "amount": dep["amount"],
+                                  "note": f"SMM deposit {u.effective_user.first_name}"})
+                    if code != 200 or not isinstance(j, dict) or not j.get("order_id"):
+                        c.user_data.pop("deposit", None)
+                        await u.message.reply_text(
+                            f"❌ Gateway error ({code}): {j.get('error', 'unknown') if isinstance(j, dict) else 'no response'}\n"
+                            "Try again or contact admin.", reply_markup=main_menu(is_owner))
+                        return
+                    did = f"D{int(time.time())}"
+                    d["deposits"][did] = {"uid": str(uid), "name": u.effective_user.first_name,
+                                          "amount": dep["amount"], "gw_order": j["order_id"],
+                                          "status": "pending_gw", "at": time.time()}
+                    _save(d)
+                    c.user_data.pop("deposit", None)
+                    import base64 as _b64
+                    qr_bytes = _b64.b64decode(j["qr_base64"])
+                    pay_amt = j.get("amount_paise", int(dep["amount"] * 100)) / 100
+                    kb = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔄 Check Payment Status", callback_data=f"gwcheck:{did}")],
+                        [InlineKeyboardButton("❌ Cancel", callback_data="dep_cancel")]])
+                    await u.message.reply_photo(
+                        qr_bytes,
+                        caption=f"💳 <b>Pay ₹{pay_amt:.2f}</b> via any UPI app 🌉\n\n"
+                                f"⏳ QR valid for 15 min.\nPay, then tap 🔄 Check Payment Status",
+                        reply_markup=kb, parse_mode="HTML")
+                    return
+                # ---- manual UPI fallback ----
                 dep["stage"] = "pay"
                 upi = d["cfg"]["upi"]
                 params = urllib.parse.urlencode({"pa": upi, "pn": "SMM Panel", "am": f"{amt:.2f}", "cu": "INR"})
